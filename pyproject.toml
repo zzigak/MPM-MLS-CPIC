@@ -1,0 +1,13 @@
+[project]
+name = "mls-mpm-3d"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.9.4",
+    "numpy>=2.0.2",
+    "scikit-image>=0.24.0",
+    "taichi>=1.7.3",
+    "trimesh>=4.6.9",
+]
