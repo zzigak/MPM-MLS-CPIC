@@ -24,6 +24,10 @@ nu = 0.2 # poisson's ratio
 
 mu_0, lamb_0 = E / (2*(1+nu)), E*nu / ((1+nu) * (1-2*nu)) # Lame params
 
+# CPIC compatibility tracking
+n_bodies = 2  # Number of different material types (liquid and jello)
+p_T = ti.field(dtype=ti.i32, shape=(num_particles, n_bodies))  # Particle type flags
+grid_T = ti.field(dtype=ti.i32, shape=(grid_res, grid_res, n_bodies))  # Grid node type flags
 
 # define particle properties
 x = ti.Vector.field(dim, dtype=ti.f32, shape=num_particles) # Position
@@ -61,6 +65,8 @@ def sub_step():
     for I in ti.grouped(grid_m): # Iterate over one grid (they have same shape)
         grid_v[I].fill(0.0)
         grid_m[I] = 0.0
+        for b in range(n_bodies):
+            grid_T[I[0], I[1], b] = 0
 
     for I in ti.grouped(grid_m_liquid):
         grid_m_liquid[I] = 0.0
@@ -122,26 +128,32 @@ def sub_step():
         # Combine stress and APIC terms into the matrix Q used for scattering
         Q = stress_term + p_m * C[p]
 
-
-        for offs in ti.static(ti.ndrange(*([3] * dim))):
-            grid_offset = ti.Vector(offs)
-            x_i = grid_offset * dx
-            x_p = fracXY * dx
-
-            # combine per-axis weights
-            weight = 1.0
-            for d in ti.static(range(dim)):
-                weight *= w[offs[d]][d]
-
-            idx = base_coord + grid_offset
-
-            # Scatter momentum to grid_v and mass to grid_m
-            grid_v[idx] += weight * (p_m * v[p]+ Q @ (x_i-x_p))
-            grid_m[idx] += weight * p_m
-            if p_material[p] == 0:
-                grid_m_liquid[idx] += weight * p_m
-            else:
-                grid_m_jello[idx]  += weight * p_m
+        # CPIC P2G
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            flag = 1
+            # Check compatibility
+            for k in ti.static(range(n_bodies)):
+                if p_T[p, k] == grid_T[base_coord[0] + offset[0], base_coord[1] + offset[1], k] or \
+                   p_T[p, k] * grid_T[base_coord[0] + offset[0], base_coord[1] + offset[1], k] == 0:
+                    pass
+                else:
+                    flag = 0
+            if flag:
+                # Compatible particle and grid node
+                dpos = (offset.cast(float) - fracXY) * dx
+                weight = w[i][0] * w[j][1]
+                grid_v[base_coord + offset] += weight * (p_m * v[p] + Q @ dpos)
+                grid_m[base_coord + offset] += weight * p_m
+                # Update grid type flags
+                for k in ti.static(range(n_bodies)):
+                    if p_T[p, k] == 1:
+                        grid_T[base_coord[0] + offset[0], base_coord[1] + offset[1], k] = 1
+                # Update material-specific mass grids for marching squares
+                if p_material[p] == 0:  # liquid
+                    grid_m_liquid[base_coord + offset] += weight * p_m
+                else:  # jello
+                    grid_m_jello[base_coord + offset] += weight * p_m
 
     # for all grid nodes, apply gravity, handle collisions with boundaries
     for I in ti.grouped(grid_m): # Iterate over one grid
@@ -153,7 +165,7 @@ def sub_step():
 
             # Boundary conditions
             for d in ti.static(range(dim)):
-                # if we’re within 3 cells of the lower face and pointing outwards
+                # if we're within 3 cells of the lower face and pointing outwards
                 if I[d] < 3 and grid_v[I][d] < 0:
                     grid_v[I][d] = 0
                 # if within 3 cells of the upper face and pointing outwards
@@ -264,9 +276,10 @@ def sub_step():
 def init():
     num_particles_per_block = num_particles // 2
     for i in range(num_particles):
-
         if i < num_particles_per_block: # Liquid Block (Material 0) - Top, Larger Volume
             p_material[i] = 0
+            p_T[i, 0] = 1  # Liquid type flag
+            p_T[i, 1] = 0  # Not jello
             if ti.static(dim == 2):
                 # x in [0.3, 0.7], y in [0.5, 0.9] (Width 0.4 x 0.4)
                 x[i] = [ti.random() * 0.4 + 0.3, ti.random() * 0.4 + 0.5]
@@ -275,6 +288,8 @@ def init():
                 x[i] = [ti.random() * 0.4 + 0.3, ti.random() * 0.4 + 0.5, ti.random() * 0.4 + 0.3]
         else: # Jello Block (Material 1) - Bottom, Smaller Volume (denser)
              p_material[i] = 1
+             p_T[i, 0] = 0  # Not liquid
+             p_T[i, 1] = 1  # Jello type flag
              if ti.static(dim == 2):
                 # x in [0.4, 0.6], y in [0.1, 0.3] (Width 0.2 x 0.2) -> 1/4th the area
                 x[i] = [ti.random() * 0.2 + 0.4, ti.random() * 0.2 + 0.1]
@@ -322,6 +337,8 @@ def init_2():
     for i in range(num_particles):
         if i < num_liquid_particles: # Liquid Block (Material 0) - Top, Large Volume
             p_material[i] = 0
+            p_T[i, 0] = 1  # Liquid type flag
+            p_T[i, 1] = 0  # Not jello
             if ti.static(dim == 2):
                 # x in [0.1, 0.9], y in [0.6, 0.9] (Width 0.8 x 0.3)
                 x[i] = [ti.random() * 0.8 + 0.1, ti.random() * 0.3 + 0.6]
@@ -330,6 +347,8 @@ def init_2():
                 x[i] = [ti.random() * 0.8 + 0.1, ti.random() * 0.3 + 0.6, ti.random() * 0.8 + 0.1]
         else: # Jello Blocks (Material 1) - Middle/Upper-Middle, 10 Small Cubes
              p_material[i] = 1
+             p_T[i, 0] = 0  # Not liquid
+             p_T[i, 1] = 1  # Jello type flag
 
              # Determine which cube this particle belongs to
              particle_index_in_jello = i - num_liquid_particles
@@ -376,7 +395,7 @@ def init_3():
         particles_per_cube = 1 # Ensure at least one particle per cube if possible
 
     cube_width = 0.1 # Width of each cube
-
+    
     # Calculate spacing for horizontal layout
     # Place centers within the range [0.15, 0.85] for padding
     first_center_x = 0.15
@@ -397,6 +416,8 @@ def init_3():
 
         # All particles are jello in this scene
         p_material[i] = 1
+        p_T[i, 0] = 0  # Not liquid
+        p_T[i, 1] = 1  # Jello type flag
 
         # Calculate the center of the assigned cube
         current_center_x = first_center_x + cube_index * center_spacing_x
